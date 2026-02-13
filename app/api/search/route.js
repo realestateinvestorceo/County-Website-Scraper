@@ -53,7 +53,7 @@ export async function POST(request) {
         `Search ${chunk.from}-${chunk.to}`
       );
       allFiles.push(...files);
-      await delay(1000);
+      await delay(500);
     }
 
     // Deduplicate by file number
