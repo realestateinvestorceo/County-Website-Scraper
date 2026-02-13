@@ -1,16 +1,13 @@
 /**
  * GET /api/debug
  *
- * Diagnostic endpoint to test Browserless.io connection and report
- * what's working and what's not. Does NOT scrape anything — just
- * tests the connection chain step by step.
- *
- * Includes the welcome gate bypass that the court website requires.
+ * Diagnostic endpoint that uses the same connectBrowser() flow as the
+ * scraper, then checks if we actually reached the File Search page.
  */
 import { NextResponse } from 'next/server';
 import { BROWSERLESS_WS_ENDPOINT, BASE_URL } from '@/lib/config';
 
-export const maxDuration = 45;
+export const maxDuration = 60;
 
 export async function GET() {
   const results = {
@@ -20,7 +17,7 @@ export async function GET() {
     error: null,
   };
 
-  // Step 1: Check env variable
+  // Environment info
   const apiKey = process.env.BROWSERLESS_API_KEY;
   const hasKey = !!apiKey && apiKey !== 'your_api_key_here';
   results.env.BROWSERLESS_API_KEY = hasKey ? `set (${apiKey.length} chars, starts with ${apiKey.substring(0, 4)}...)` : 'NOT SET';
@@ -28,235 +25,113 @@ export async function GET() {
   results.env.VERCEL_ENV = process.env.VERCEL_ENV || 'not on vercel';
   results.env.VERCEL_REGION = process.env.VERCEL_REGION || 'unknown';
 
-  results.steps.push({
-    step: 'Check API key',
-    status: hasKey ? 'PASS' : 'FAIL',
-    detail: hasKey ? `Key is ${apiKey.length} characters` : 'BROWSERLESS_API_KEY env var is missing or is placeholder',
-  });
-
   if (!hasKey) {
-    results.error = 'No valid API key found. Set BROWSERLESS_API_KEY in Vercel Environment Variables.';
+    results.steps.push({ step: 'Check API key', status: 'FAIL', detail: 'BROWSERLESS_API_KEY not set' });
+    results.error = 'No valid API key found.';
     return NextResponse.json(results);
   }
 
-  // Step 2: Check playwright-core loads
-  let chromium;
-  try {
-    const pw = await import('playwright-core');
-    chromium = pw.chromium;
-    results.steps.push({
-      step: 'Load playwright-core',
-      status: 'PASS',
-      detail: 'Module loaded successfully',
-    });
-  } catch (err) {
-    results.steps.push({
-      step: 'Load playwright-core',
-      status: 'FAIL',
-      detail: err.message.substring(0, 300),
-    });
-    results.error = `playwright-core failed to load: ${err.message}`;
-    return NextResponse.json(results);
-  }
+  results.steps.push({ step: 'Check API key', status: 'PASS', detail: `Key is ${apiKey.length} characters` });
 
-  // Step 3: Test Browserless.io connection
-  const wsEndpoint = BROWSERLESS_WS_ENDPOINT(apiKey);
-  results.steps.push({
-    step: 'Build WebSocket URL',
-    status: 'PASS',
-    detail: wsEndpoint.replace(apiKey, 'API_KEY_HIDDEN'),
-  });
-
+  // Use connectBrowser — this tests the full Welcome → CAPTCHA → Search flow
   let browser;
   try {
-    browser = await chromium.connectOverCDP(wsEndpoint);
+    const { connectBrowser } = await import('@/lib/scraper/browser');
+
+    results.steps.push({ step: 'Load modules', status: 'PASS', detail: 'browser.js loaded' });
+
+    const startTime = Date.now();
+    const connection = await connectBrowser();
+    browser = connection.browser;
+    const { page } = connection;
+    const connectTime = Date.now() - startTime;
+
     results.steps.push({
-      step: 'Connect to Browserless.io via CDP',
+      step: 'connectBrowser() (includes welcome + CAPTCHA)',
       status: 'PASS',
-      detail: 'Browser connected',
-    });
-  } catch (err) {
-    results.steps.push({
-      step: 'Connect to Browserless.io via CDP',
-      status: 'FAIL',
-      detail: err.message.substring(0, 500),
-    });
-    results.error = `Browserless connection failed: ${err.message.substring(0, 300)}`;
-    return NextResponse.json(results);
-  }
-
-  // Step 4: Create page
-  try {
-    const context = browser.contexts()[0] || await browser.newContext();
-    const page = context.pages()[0] || await context.newPage();
-    page.setDefaultTimeout(20000);
-
-    results.steps.push({
-      step: 'Create browser page',
-      status: 'PASS',
-      detail: 'Page created',
+      detail: `Completed in ${(connectTime / 1000).toFixed(1)}s — final URL: ${page.url()}`,
     });
 
-    // Step 5: Bypass the Welcome gate
-    // The court website redirects all first-visit requests to /Home/Welcome
-    // and requires clicking "Start Search" to set a session cookie.
-    await page.goto(`${BASE_URL}/Home/Welcome`, {
+    // Now try navigating to File Search
+    await page.goto(`${BASE_URL}/File/FileSearch`, {
       waitUntil: 'domcontentloaded',
-      timeout: 15000,
+      timeout: 12000,
     });
 
-    const welcomeUrl = page.url();
-    const welcomeTitle = await page.title();
+    const url = page.url();
+    const title = await page.title();
 
-    const startBtn = await page.$('button[name="WelcomePageButton"][value="Start"]');
-    if (startBtn) {
-      await startBtn.click();
-      await page.waitForLoadState('domcontentloaded');
+    // Check if redirected to welcome or authenticate
+    if (url.includes('Welcome') || url.includes('Authenticate')) {
       results.steps.push({
-        step: 'Bypass welcome gate',
-        status: 'PASS',
-        detail: `Clicked "Start Search" on welcome page (${welcomeUrl})`,
+        step: 'Navigate to File Search',
+        status: 'FAIL',
+        detail: `Redirected to gate page: ${url}`,
       });
+
+      // Capture what we see for debugging
+      const bodyText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '(empty)');
+      results.steps.push({
+        step: 'Page content',
+        status: 'FAIL',
+        detail: bodyText.replace(/\n/g, ' ').substring(0, 300),
+      });
+
+      results.error = `Cannot reach File Search — redirected to: ${url}`;
     } else {
       results.steps.push({
-        step: 'Bypass welcome gate',
+        step: 'Navigate to File Search',
         status: 'PASS',
-        detail: `No welcome button found — may already be past the gate (url: ${welcomeUrl}, title: "${welcomeTitle}")`,
+        detail: `URL: ${url} — Title: "${title}"`,
       });
-    }
 
-    // Small delay to let cookie settle
-    await new Promise((r) => setTimeout(r, 1000));
+      // Check form elements
+      const formCheck = {
+        courtDropdown: !!(await page.$('#CourtSelect')),
+        proceedingDropdown: !!(await page.$('#SelectedProceeding')),
+        fileNumberInput: !!(await page.$('#FileNumber')),
+        fromDateInput: !!(await page.$('#txtFilingDateFrom')),
+        toDateInput: !!(await page.$('#txtFilingDateTo')),
+      };
 
-    // Step 6: Navigate to the File Search page
-    const targetUrl = BASE_URL + '/File/FileSearch';
-    let response;
-    try {
-      response = await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 20000 });
-    } catch {
-      response = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    }
+      const allFound = Object.values(formCheck).every(Boolean);
+      results.steps.push({
+        step: 'Verify form elements',
+        status: allFound ? 'PASS' : 'FAIL',
+        detail: allFound
+          ? 'All form elements found'
+          : `Missing: ${Object.entries(formCheck).filter(([,v]) => !v).map(([k]) => k).join(', ')}`,
+        formCheck,
+      });
 
-    const title = await page.title();
-    const url = page.url();
-    const httpStatus = response?.status() || 'unknown';
-
-    // Check if we got redirected back to welcome
-    const redirectedBack = url.includes('/Home/Welcome');
-
-    results.steps.push({
-      step: 'Navigate to File Search page',
-      status: redirectedBack ? 'FAIL' : 'PASS',
-      detail: redirectedBack
-        ? `Redirected back to welcome page: ${url}`
-        : `HTTP ${httpStatus} — URL: ${url} — Title: "${title}"`,
-    });
-
-    if (redirectedBack) {
-      results.error = 'Still being redirected to Welcome page after bypass attempt.';
-      await page.close();
-      return NextResponse.json(results, { status: 500 });
-    }
-
-    // Step 7: Capture page snapshot
-    const bodyText = await page.evaluate(() => {
-      return document.body?.innerText?.substring(0, 2000) || '(empty body)';
-    });
-    const formElements = await page.evaluate(() => {
-      const selects = document.querySelectorAll('select');
-      const selectInfo = Array.from(selects).map(s => ({
-        id: s.id,
-        name: s.name,
-        options: s.options.length,
-      }));
-      const inputs = document.querySelectorAll('input');
-      const inputInfo = Array.from(inputs).map(inp => ({
-        id: inp.id,
-        name: inp.name,
-        type: inp.type,
-      }));
-      const buttons = document.querySelectorAll('button');
-      const buttonInfo = Array.from(buttons).map(b => ({
-        id: b.id,
-        name: b.name,
-        type: b.type,
-        text: b.textContent?.trim()?.substring(0, 50),
-      }));
-      return { selects: selectInfo, inputs: inputInfo, buttons: buttonInfo };
-    });
-
-    results.steps.push({
-      step: 'Capture page snapshot',
-      status: 'PASS',
-      detail: `Body text starts with: "${bodyText.substring(0, 200).replace(/\n/g, ' ')}"`,
-      formElements,
-    });
-
-    // Step 8: Check form elements
-    const courtDropdown = await page.$('#CourtSelect');
-    const proceedingDropdown = await page.$('#SelectedProceeding');
-    const fileInput = await page.$('#FileNumber');
-    const dateFrom = await page.$('#txtFilingDateFrom');
-    const dateTo = await page.$('#txtFilingDateTo');
-    const searchBtn1 = await page.$('#FileSearchSubmit');
-    const searchBtn2 = await page.$('#FileSearchSubmit2');
-
-    const formCheck = {
-      courtDropdown: !!courtDropdown,
-      proceedingDropdown: !!proceedingDropdown,
-      fileNumberInput: !!fileInput,
-      fromDateInput: !!dateFrom,
-      toDateInput: !!dateTo,
-      fileSearchButton: !!searchBtn1,
-      dateSearchButton: !!searchBtn2,
-    };
-
-    const allFormFound = Object.values(formCheck).every(Boolean);
-
-    results.steps.push({
-      step: 'Verify court form elements',
-      status: allFormFound ? 'PASS' : 'FAIL',
-      detail: allFormFound
-        ? 'All 7 form elements found'
-        : `Missing: ${Object.entries(formCheck).filter(([,v]) => !v).map(([k]) => k).join(', ')}`,
-      formCheck,
-    });
-
-    // Step 9: Try selecting Erie County
-    if (courtDropdown) {
-      try {
-        await page.selectOption('#CourtSelect', '15');
-        const selectedValue = await page.$eval('#CourtSelect', el => el.value);
-        results.steps.push({
-          step: 'Select Erie County (value=15)',
-          status: selectedValue === '15' ? 'PASS' : 'FAIL',
-          detail: selectedValue === '15' ? 'Successfully selected Erie County' : `Selected value is: ${selectedValue}`,
-        });
-      } catch (err) {
-        results.steps.push({
-          step: 'Select Erie County (value=15)',
-          status: 'FAIL',
-          detail: err.message.substring(0, 200),
-        });
+      // Try selecting Erie County
+      if (formCheck.courtDropdown) {
+        try {
+          await page.selectOption('#CourtSelect', '15');
+          results.steps.push({ step: 'Select Erie County', status: 'PASS', detail: 'value=15 selected' });
+        } catch (err) {
+          results.steps.push({ step: 'Select Erie County', status: 'FAIL', detail: err.message.substring(0, 200) });
+        }
       }
     }
 
     await page.close();
   } catch (err) {
     results.steps.push({
-      step: 'Navigate/verify court website',
+      step: 'connectBrowser() or navigation',
       status: 'FAIL',
-      detail: err.message.substring(0, 300),
+      detail: err.message.substring(0, 400),
     });
-    results.error = `Navigation failed: ${err.message.substring(0, 300)}`;
+    results.error = err.message.substring(0, 300);
   } finally {
-    try { await browser.close(); } catch { /* ignore */ }
+    if (browser) {
+      try { await browser.close(); } catch { /* ignore */ }
+    }
   }
 
-  // Summary
   const allPassed = results.steps.every((s) => s.status === 'PASS');
   if (allPassed && !results.error) {
-    results.summary = 'ALL TESTS PASSED — Connection, welcome bypass, and form verification all working.';
+    results.summary = 'ALL TESTS PASSED — Full gate bypass + form verification working.';
   }
 
   return NextResponse.json(results, { status: results.error ? 500 : 200 });
