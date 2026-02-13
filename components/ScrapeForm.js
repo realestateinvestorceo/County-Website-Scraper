@@ -95,11 +95,28 @@ export default function ScrapeForm() {
       });
 
       if (!searchRes.ok) {
-        const err = await searchRes.json();
-        throw new Error(err.error || 'Search request failed');
+        let errMsg = `Search failed (HTTP ${searchRes.status})`;
+        try {
+          const err = await searchRes.json();
+          errMsg = err.error || errMsg;
+        } catch {
+          // Response wasn't JSON — read as text for debugging
+          try {
+            const text = await searchRes.text();
+            errMsg = text.substring(0, 200) || errMsg;
+          } catch { /* ignore */ }
+        }
+        throw new Error(errMsg);
       }
 
-      const { files, totalCount, dateChunks } = await searchRes.json();
+      let searchData;
+      try {
+        searchData = await searchRes.json();
+      } catch {
+        const text = await searchRes.text();
+        throw new Error(`Server returned invalid response: ${text.substring(0, 200)}`);
+      }
+      const { files, totalCount, dateChunks } = searchData;
 
       setAllFiles(files);
       setStats((s) => ({ ...s, found: totalCount }));
@@ -156,15 +173,26 @@ export default function ScrapeForm() {
         }
 
         if (!batchResponse.ok) {
-          const errData = await batchResponse.json().catch(() => ({}));
-          addLog(`Batch ${i + 1} error: ${errData.error || 'Unknown error'}. Skipping...`);
+          let errMsg = `HTTP ${batchResponse.status}`;
+          try { const d = await batchResponse.json(); errMsg = d.error || errMsg; } catch {
+            try { errMsg = (await batchResponse.text()).substring(0, 200); } catch {}
+          }
+          addLog(`Batch ${i + 1} error: ${errMsg}. Skipping...`);
           runningStats.errors += batches[i].length;
           runningStats.processed += batches[i].length;
           setStats({ ...runningStats });
           continue;
         }
 
-        const { results: batchResults, batchStats } = await batchResponse.json();
+        let batchData;
+        try { batchData = await batchResponse.json(); } catch {
+          addLog(`Batch ${i + 1}: invalid response from server. Skipping...`);
+          runningStats.errors += batches[i].length;
+          runningStats.processed += batches[i].length;
+          setStats({ ...runningStats });
+          continue;
+        }
+        const { results: batchResults, batchStats } = batchData;
 
         allResults = [...allResults, ...batchResults];
         setResults([...allResults]);
