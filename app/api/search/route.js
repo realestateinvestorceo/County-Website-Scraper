@@ -10,6 +10,7 @@ import { NextResponse } from 'next/server';
 import { connectBrowser, delay, withRetry } from '@/lib/scraper/browser';
 import { splitDateRange } from '@/lib/scraper/dateUtils';
 import { searchAndCollectFiles } from '@/lib/scraper/search';
+import { logError } from '@/lib/errorLog';
 
 // Vercel serverless timeout (seconds)
 export const maxDuration = 60;
@@ -70,7 +71,9 @@ export async function POST(request) {
       dateChunks,
     });
   } catch (err) {
-    console.error('Search API error:', err);
+    logError('api/search', err.message, {
+      stack: err.stack?.substring(0, 500),
+    });
     return NextResponse.json({ error: err.message }, { status: 500 });
   } finally {
     if (browser) {

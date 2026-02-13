@@ -14,6 +14,7 @@ import {
   parseProbateText,
   meetsValueThreshold,
 } from '@/lib/scraper/pdfParser';
+import { logError } from '@/lib/errorLog';
 
 // Vercel serverless timeout (seconds)
 export const maxDuration = 60;
@@ -114,6 +115,10 @@ export async function POST(request) {
         });
         batchStats.included++;
       } catch (err) {
+        logError('api/process-batch', err.message, {
+          fileNumber: file.fileNumber,
+          stack: err.stack?.substring(0, 300),
+        });
         results.push({
           fileNumber: file.fileNumber,
           fileDate: file.fileDate,
@@ -134,7 +139,9 @@ export async function POST(request) {
       batchStats,
     });
   } catch (err) {
-    console.error('Process-batch API error:', err);
+    logError('api/process-batch', err.message, {
+      stack: err.stack?.substring(0, 500),
+    });
     return NextResponse.json({ error: err.message }, { status: 500 });
   } finally {
     if (browser) {
