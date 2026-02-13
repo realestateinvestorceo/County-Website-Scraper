@@ -5,8 +5,7 @@
  * what's working and what's not. Does NOT scrape anything — just
  * tests the connection chain step by step.
  *
- * Captures page HTML snippets so we can see exactly what the headless
- * browser is loading (Terms of Use gate, redirect, different markup, etc.).
+ * Includes the welcome gate bypass that the court website requires.
  */
 import { NextResponse } from 'next/server';
 import { BROWSERLESS_WS_ENDPOINT, BASE_URL } from '@/lib/config';
@@ -86,10 +85,11 @@ export async function GET() {
     return NextResponse.json(results);
   }
 
-  // Step 4: Create page and navigate
+  // Step 4: Create page
   try {
     const context = browser.contexts()[0] || await browser.newContext();
     const page = context.pages()[0] || await context.newPage();
+    page.setDefaultTimeout(20000);
 
     results.steps.push({
       step: 'Create browser page',
@@ -97,13 +97,43 @@ export async function GET() {
       detail: 'Page created',
     });
 
-    // Step 5: Navigate to the court website — use networkidle to wait for JS
+    // Step 5: Bypass the Welcome gate
+    // The court website redirects all first-visit requests to /Home/Welcome
+    // and requires clicking "Start Search" to set a session cookie.
+    await page.goto(`${BASE_URL}/Home/Welcome`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 15000,
+    });
+
+    const welcomeUrl = page.url();
+    const welcomeTitle = await page.title();
+
+    const startBtn = await page.$('button[name="WelcomePageButton"][value="Start"]');
+    if (startBtn) {
+      await startBtn.click();
+      await page.waitForLoadState('domcontentloaded');
+      results.steps.push({
+        step: 'Bypass welcome gate',
+        status: 'PASS',
+        detail: `Clicked "Start Search" on welcome page (${welcomeUrl})`,
+      });
+    } else {
+      results.steps.push({
+        step: 'Bypass welcome gate',
+        status: 'PASS',
+        detail: `No welcome button found — may already be past the gate (url: ${welcomeUrl}, title: "${welcomeTitle}")`,
+      });
+    }
+
+    // Small delay to let cookie settle
+    await new Promise((r) => setTimeout(r, 1000));
+
+    // Step 6: Navigate to the File Search page
     const targetUrl = BASE_URL + '/File/FileSearch';
     let response;
     try {
       response = await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 20000 });
     } catch {
-      // If networkidle times out, fall back to domcontentloaded
       response = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     }
 
@@ -111,33 +141,40 @@ export async function GET() {
     const url = page.url();
     const httpStatus = response?.status() || 'unknown';
 
+    // Check if we got redirected back to welcome
+    const redirectedBack = url.includes('/Home/Welcome');
+
     results.steps.push({
-      step: 'Navigate to court website',
-      status: 'PASS',
-      detail: `HTTP ${httpStatus} — URL: ${url} — Title: "${title}"`,
+      step: 'Navigate to File Search page',
+      status: redirectedBack ? 'FAIL' : 'PASS',
+      detail: redirectedBack
+        ? `Redirected back to welcome page: ${url}`
+        : `HTTP ${httpStatus} — URL: ${url} — Title: "${title}"`,
     });
 
-    // Step 6: Capture page snapshot for diagnostics
-    // Get the first 2000 chars of body text to see what actually loaded
+    if (redirectedBack) {
+      results.error = 'Still being redirected to Welcome page after bypass attempt.';
+      await page.close();
+      return NextResponse.json(results, { status: 500 });
+    }
+
+    // Step 7: Capture page snapshot
     const bodyText = await page.evaluate(() => {
       return document.body?.innerText?.substring(0, 2000) || '(empty body)';
     });
-    const bodyHtmlSnippet = await page.evaluate(() => {
-      // Get select elements info
+    const formElements = await page.evaluate(() => {
       const selects = document.querySelectorAll('select');
       const selectInfo = Array.from(selects).map(s => ({
         id: s.id,
         name: s.name,
         options: s.options.length,
       }));
-      // Get input elements info
       const inputs = document.querySelectorAll('input');
       const inputInfo = Array.from(inputs).map(inp => ({
         id: inp.id,
         name: inp.name,
         type: inp.type,
       }));
-      // Get button elements info
       const buttons = document.querySelectorAll('button');
       const buttonInfo = Array.from(buttons).map(b => ({
         id: b.id,
@@ -151,17 +188,18 @@ export async function GET() {
     results.steps.push({
       step: 'Capture page snapshot',
       status: 'PASS',
-      detail: `Body text starts with: "${bodyText.substring(0, 300).replace(/\n/g, ' ')}"`,
-      formElements: bodyHtmlSnippet,
+      detail: `Body text starts with: "${bodyText.substring(0, 200).replace(/\n/g, ' ')}"`,
+      formElements,
     });
 
-    // Step 7: Check that the page has the expected form elements
-    // Use exact selectors from the live page analysis
-    const courtDropdown = await page.$('#CourtSelect, select[id*="Court"], select[name*="Court"]');
-    const proceedingDropdown = await page.$('#SelectedProceeding, select[id*="Proceeding"]');
-    const fileInput = await page.$('#FileNumber, input[name="FileNumber"]');
-    const dateFrom = await page.$('#txtFilingDateFrom, input[name="FromDateString"]');
-    const dateTo = await page.$('#txtFilingDateTo, input[name="ToDateString"]');
+    // Step 8: Check form elements
+    const courtDropdown = await page.$('#CourtSelect');
+    const proceedingDropdown = await page.$('#SelectedProceeding');
+    const fileInput = await page.$('#FileNumber');
+    const dateFrom = await page.$('#txtFilingDateFrom');
+    const dateTo = await page.$('#txtFilingDateTo');
+    const searchBtn1 = await page.$('#FileSearchSubmit');
+    const searchBtn2 = await page.$('#FileSearchSubmit2');
 
     const formCheck = {
       courtDropdown: !!courtDropdown,
@@ -169,6 +207,8 @@ export async function GET() {
       fileNumberInput: !!fileInput,
       fromDateInput: !!dateFrom,
       toDateInput: !!dateTo,
+      fileSearchButton: !!searchBtn1,
+      dateSearchButton: !!searchBtn2,
     };
 
     const allFormFound = Object.values(formCheck).every(Boolean);
@@ -177,16 +217,16 @@ export async function GET() {
       step: 'Verify court form elements',
       status: allFormFound ? 'PASS' : 'FAIL',
       detail: allFormFound
-        ? 'All form elements found (court, proceeding, file#, dates)'
-        : `Missing elements: ${Object.entries(formCheck).filter(([,v]) => !v).map(([k]) => k).join(', ')}`,
+        ? 'All 7 form elements found'
+        : `Missing: ${Object.entries(formCheck).filter(([,v]) => !v).map(([k]) => k).join(', ')}`,
       formCheck,
     });
 
-    // Step 8: Try selecting Erie County to verify interactivity
+    // Step 9: Try selecting Erie County
     if (courtDropdown) {
       try {
-        await page.selectOption('#CourtSelect, select[id*="Court"]', '15');
-        const selectedValue = await page.$eval('#CourtSelect, select[id*="Court"]', el => el.value);
+        await page.selectOption('#CourtSelect', '15');
+        const selectedValue = await page.$eval('#CourtSelect', el => el.value);
         results.steps.push({
           step: 'Select Erie County (value=15)',
           status: selectedValue === '15' ? 'PASS' : 'FAIL',
@@ -216,7 +256,7 @@ export async function GET() {
   // Summary
   const allPassed = results.steps.every((s) => s.status === 'PASS');
   if (allPassed && !results.error) {
-    results.summary = 'ALL TESTS PASSED — Browserless.io connection and court website are working.';
+    results.summary = 'ALL TESTS PASSED — Connection, welcome bypass, and form verification all working.';
   }
 
   return NextResponse.json(results, { status: results.error ? 500 : 200 });
